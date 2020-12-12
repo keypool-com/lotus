@@ -204,6 +204,12 @@ lotus-wallet:
 .PHONY: lotus-wallet
 BINS+=lotus-wallet
 
+lotus-offline-wallet:
+	rm -f lotus-offline-wallet
+	go build -o lotus-offline-wallet ./cmd/lotus-offline-wallet
+.PHONY: lotus-offline-wallet
+BINS+=lotus-offline-wallet
+
 testground:
 	go build -tags testground -o /dev/null ./cmd/lotus
 .PHONY: testground

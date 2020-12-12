@@ -1,23 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"go.opencensus.io/stats/view"
+	"encoding/hex"
+	"fmt"
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/chain/wallet"
+	ledgerwallet "github.com/filecoin-project/lotus/chain/wallet/ledger"
+	"github.com/ipfs/go-cid"
 	"net"
 	"net/http"
 	"os"
+	"sync"
 
 	"github.com/gorilla/mux"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/urfave/cli/v2"
+	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
 
 	"github.com/filecoin-project/go-jsonrpc"
 
-	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
-	"github.com/filecoin-project/lotus/chain/wallet"
-	ledgerwallet "github.com/filecoin-project/lotus/chain/wallet/ledger"
 	lcli "github.com/filecoin-project/lotus/cli"
 	"github.com/filecoin-project/lotus/lib/lotuslog"
 	"github.com/filecoin-project/lotus/metrics"
@@ -33,10 +39,13 @@ func main() {
 
 	local := []*cli.Command{
 		runCmd,
+		walletCmd,
+		nodeCmd,
+		signCmd,
 	}
 
 	app := &cli.App{
-		Name:    "lotus-wallet",
+		Name:    "lotus-offline-wallet",
 		Usage:   "Basic external wallet",
 		Version: build.UserVersion(),
 		Flags: []cli.Flag{
@@ -106,27 +115,15 @@ var runCmd = &cli.Command{
 			return err
 		}
 
-		ks, err := lr.KeyStore()
+		ds, err := lr.Datastore("/metadata")
 		if err != nil {
-			return err
+			return nil
 		}
 
-		lw, err := wallet.NewWallet(ks)
-		if err != nil {
-			return err
-		}
-
-		var w api.WalletAPI = lw
-		if cctx.Bool("ledger") {
-			ds, err := lr.Datastore("/metadata")
-			if err != nil {
-				return err
-			}
-
-			w = wallet.MultiWallet{
-				Local:  lw,
-				Ledger: ledgerwallet.NewWallet(ds),
-			}
+		ow := &OfflineWallet{
+			ds: ds,
+			unsigned: make(map[address.Address]map[cid.Cid]PendingUnsignedMessage),
+			lock:     sync.Mutex{},
 		}
 
 		address := cctx.String("listen")
@@ -135,15 +132,10 @@ var runCmd = &cli.Command{
 		log.Info("Setting up API endpoint at " + address)
 
 		rpcServer := jsonrpc.NewServer()
-		rpcServer.Register("Filecoin", &LoggedWallet{under: metrics.MetricedWalletAPI(w)})
+		rpcServer.Register("Filecoin", ow)
 
 		mux.Handle("/rpc/v0", rpcServer)
 		mux.PathPrefix("/").Handler(http.DefaultServeMux) // pprof
-
-		/*ah := &auth.Handler{
-			Verify: nodeApi.AuthVerify,
-			Next:   mux.ServeHTTP,
-		}*/
 
 		srv := &http.Server{
 			Handler: mux,
@@ -169,4 +161,115 @@ var runCmd = &cli.Command{
 
 		return srv.Serve(nl)
 	},
+}
+
+var signCmd = &cli.Command{
+	Name:  "sign",
+	Usage: "sign transaction-hex",
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 1 {
+			return fmt.Errorf("require transaction hex")
+		}
+
+		data, err := hex.DecodeString(cctx.Args().First())
+		if err != nil {
+			return nil
+		}
+
+		buf := bytes.NewBuffer(data)
+
+		var msg UnsignedMessage
+		err = msg.UnmarshalCBOR(buf)
+		if err != nil {
+			return err
+		}
+
+		w, err := createWallet(cctx)
+		if err != nil {
+			return err
+		}
+
+		ctx := lcli.ReqContext(cctx)
+
+		sig, err := w.WalletSign(ctx, msg.Address, msg.ToSign, api.MsgMeta{
+			Type: msg.Meta.Type,
+			Extra: msg.Meta.Extra,
+		})
+
+		if err != nil {
+			return err
+		}
+
+		signed := SignedMessage{
+			UnsignedMessage: msg,
+			Signature: *sig,
+		}
+
+		buf.Reset()
+
+		err = signed.MarshalCBOR(buf)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("%s\n", hex.EncodeToString(buf.Bytes()))
+
+		return nil
+	},
+}
+
+func apiClient(cctx *cli.Context) (*client, error) {
+	server := cctx.String("server")
+	ctx := lcli.ReqContext(cctx)
+
+	c := &client{}
+	if _, err := jsonrpc.NewClient(ctx, "ws://"+server+"/rpc/v0", "Filecoin", c, nil); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func createWallet(cctx *cli.Context) (api.WalletAPI, error) {
+	repoPath := cctx.String(FlagWalletRepo)
+	r, err := repo.NewFS(repoPath)
+	if err != nil {
+		return nil, err
+	}
+
+	ok, err := r.Exists()
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if err := r.Init(repo.Worker); err != nil {
+			return nil, err
+		}
+	}
+
+	lr, err := r.Lock(repo.Wallet)
+	if err != nil {
+		return nil, err
+	}
+
+	ks, err := lr.KeyStore()
+	if err != nil {
+		return nil, err
+	}
+
+	lw, err := wallet.NewWallet(ks)
+	if err != nil {
+		return nil, err
+	}
+
+	var w api.WalletAPI = lw
+	ds, err := lr.Datastore("/metadata")
+	if err != nil {
+		return nil, err
+	}
+
+	w = wallet.MultiWallet{
+		Local:  lw,
+		Ledger: ledgerwallet.NewWallet(ds),
+	}
+	return w, nil
 }
