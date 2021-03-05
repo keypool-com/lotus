@@ -2,15 +2,22 @@ package main
 
 import (
 	"context"
-	"net"
-	"net/http"
-	"os"
-
+	"encoding/json"
+	"github.com/filecoin-project/go-state-types/crypto"
+	"github.com/filecoin-project/lotus/api/apistruct"
+	"github.com/filecoin-project/lotus/chain/wallet/remotewallet"
+	cliutil "github.com/filecoin-project/lotus/cli/util"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/urfave/cli/v2"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+	"golang.org/x/xerrors"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
 
 	"github.com/filecoin-project/go-jsonrpc"
 
@@ -33,6 +40,8 @@ func main() {
 
 	local := []*cli.Command{
 		runCmd,
+		walletCmd,
+		connectCmd,
 	}
 
 	app := &cli.App{
@@ -77,12 +86,16 @@ var runCmd = &cli.Command{
 			Usage: "use a ledger device instead of an on-disk wallet",
 		},
 		&cli.BoolFlag{
-			Name:  "interactive",
-			Usage: "prompt before performing actions (DO NOT USE FOR MINER WORKER ADDRESS)",
+			Name:  "safe",
+			Usage: "enable safe wallet, new and export are disabled",
+		},
+		&cli.StringFlag{
+			Name:  "remote",
+			Usage: "set remote wallet address to build a wallet chain",
 		},
 		&cli.BoolFlag{
-			Name:  "offline",
-			Usage: "don't query chain state in interactive mode",
+			Name:  "server",
+			Usage: "enable wallet server which can accept connection from remote wallet clientWallet",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -125,22 +138,43 @@ var runCmd = &cli.Command{
 			return err
 		}
 
-		lw, err := wallet.NewWallet(ks)
+		var lw api.WalletAPI
+		lw, err = wallet.NewWallet(ks)
 		if err != nil {
 			return err
 		}
 
-		var w api.WalletAPI = lw
+		if cctx.IsSet("safe") {
+			lw = &SafeWallet{lw}
+		}
+
+		multi := NewMultiWallet()
+		multi.Add(lw)
+
 		if cctx.Bool("ledger") {
 			ds, err := lr.Datastore(context.Background(), "/metadata")
 			if err != nil {
 				return err
 			}
 
-			w = wallet.MultiWallet{
-				Local:  lw,
-				Ledger: ledgerwallet.NewWallet(ds),
+			ledger := ledgerwallet.NewWallet(ds)
+			multi.Add(ledger)
+		}
+
+		server := cctx.Bool("server")
+		var walletServer *WalletServer
+		if server {
+			walletServer = NewWalletServer()
+			multi.Add(walletServer)
+		}
+
+		if cctx.IsSet("remote") {
+			rw, closer, err := newRemoteWallet(cctx.Context, cctx.String("remote"))
+			if err != nil {
+				return err
 			}
+			defer closer()
+			multi.Add(rw)
 		}
 
 		address := cctx.String("listen")
@@ -148,27 +182,15 @@ var runCmd = &cli.Command{
 
 		log.Info("Setting up API endpoint at " + address)
 
-		if cctx.Bool("interactive") {
-			var ag func() (api.FullNode, jsonrpc.ClientCloser, error)
-
-			if !cctx.Bool("offline") {
-				ag = func() (api.FullNode, jsonrpc.ClientCloser, error) {
-					return lcli.GetFullNodeAPI(cctx)
-				}
-			}
-
-			w = &InteractiveWallet{
-				under:     w,
-				apiGetter: ag,
-			}
-		} else {
-			w = &LoggedWallet{under: w}
-		}
+		w := &LoggedWallet{under: multi}
 
 		rpcServer := jsonrpc.NewServer()
 		rpcServer.Register("Filecoin", metrics.MetricedWalletAPI(w))
 
 		mux.Handle("/rpc/v0", rpcServer)
+		if server {
+			mux.Handle("/ws", walletServer)
+		}
 		mux.PathPrefix("/").Handler(http.DefaultServeMux) // pprof
 
 		/*ah := &auth.Handler{
@@ -200,4 +222,128 @@ var runCmd = &cli.Command{
 
 		return srv.Serve(nl)
 	},
+}
+
+var connectCmd = &cli.Command{
+	Name:      "connect",
+	ArgsUsage: "server (default ws://localhost:1777)",
+	Usage:     "Connect to lotus wallet server",
+	Action: func(cctx *cli.Context) error {
+		var server string
+		if cctx.NArg() == 0 {
+			server = "ws://localhost:1777"
+		} else {
+			server = cctx.Args().Get(0)
+		}
+
+		w, err := createWallet(cctx)
+		if err != nil {
+			return err
+		}
+
+		log.Infof("Connecting to %s", server)
+		c, _, err := websocket.DefaultDialer.Dial(server+"/ws", nil)
+		if err != nil {
+			return xerrors.Errorf("dial:", err)
+		}
+		defer c.Close()
+
+		log.Info("connected")
+
+		interrupt := make(chan os.Signal, 1)
+		signal.Notify(interrupt, os.Interrupt)
+
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+			for {
+				var out command
+				err := c.ReadJSON(&out)
+				if err != nil {
+					log.Fatalf("read: %+v", err)
+					return
+				}
+
+				var resp command
+				switch out.Command {
+				case CommandListWalletRequest:
+					resp.Command = CommandListWalletResponse
+					addrs, err := w.WalletList(cctx.Context)
+					var e string
+					if err != nil {
+						e = err.Error()
+					}
+					resp.Data, err = json.Marshal(
+						&ListWalletResponse{
+							Addresses: addrs,
+							Err:       e,
+						})
+					if err != nil {
+						panic(err)
+					}
+				case CommandSignRequest:
+					resp.Command = CommandSignResponse
+					var req SignRequest
+					var sig *crypto.Signature
+					err := json.Unmarshal(out.Data, &req)
+					var e string
+					if err == nil {
+						sig, err = w.WalletSign(cctx.Context, req.Signer, req.ToSign, req.Meta)
+					}
+					if err != nil {
+						e = err.Error()
+					}
+					resp.Data, err = json.Marshal(
+						&SignResponse{
+							sig,
+							e,
+						})
+					if err != nil {
+						panic(err)
+					}
+				}
+				err = c.WriteJSON(&resp)
+				if err != nil {
+					log.Fatalf("write: %+v", err)
+					return
+				}
+			}
+		}()
+
+		for {
+			select {
+			case <-done:
+				return nil
+			case <-interrupt:
+				err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+				if err != nil {
+					return xerrors.Errorf("write close: %+v", err)
+				}
+			}
+		}
+	},
+}
+
+func newRemoteWallet(mctx context.Context, info string) (*remotewallet.RemoteWallet, func(), error) {
+	ai := cliutil.ParseApiInfo(info)
+
+	url, err := ai.DialArgs()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var res apistruct.WalletStruct
+	closer, err := jsonrpc.NewMergeClient(mctx, url, "Filecoin",
+		[]interface{}{
+			&res.Internal,
+		},
+		nil,
+	)
+
+	if err != nil {
+		return nil, nil, xerrors.Errorf("creating jsonrpc clientWallet: %w", err)
+	}
+
+	return &remotewallet.RemoteWallet{WalletAPI: &res}, closer, nil
 }
