@@ -15,45 +15,6 @@ import (
 	"time"
 )
 
-type WalletEvent struct {
-}
-
-type OfflineWalletAPI interface {
-	Connect(ctx context.Context, addresses ...address.Address) (<-chan WalletEvent, error)
-}
-
-type OfflineWallet struct {
-	under api.WalletAPI
-}
-
-func (o OfflineWallet) WalletNew(ctx context.Context, keyType types.KeyType) (address.Address, error) {
-	return o.under.WalletNew(ctx, keyType)
-}
-
-func (o OfflineWallet) WalletHas(ctx context.Context, address address.Address) (bool, error) {
-	return o.under.WalletHas(ctx, address)
-}
-
-func (o OfflineWallet) WalletList(ctx context.Context) ([]address.Address, error) {
-	return o.under.WalletList(ctx)
-}
-
-func (o OfflineWallet) WalletSign(ctx context.Context, signer address.Address, toSign []byte, meta api.MsgMeta) (*crypto.Signature, error) {
-	return o.under.WalletSign(ctx, signer, toSign, meta)
-}
-
-func (o OfflineWallet) WalletExport(ctx context.Context, address address.Address) (*types.KeyInfo, error) {
-	return o.under.WalletExport(ctx, address)
-}
-
-func (o OfflineWallet) WalletImport(ctx context.Context, info *types.KeyInfo) (address.Address, error) {
-	return o.under.WalletImport(ctx, info)
-}
-
-func (o OfflineWallet) WalletDelete(ctx context.Context, address address.Address) error {
-	return o.under.WalletDelete(ctx, address)
-}
-
 const (
 	CommandListWalletRequest int = iota
 	CommandListWalletResponse
